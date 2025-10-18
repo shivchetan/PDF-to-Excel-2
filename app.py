@@ -62,30 +62,14 @@ def _parse_pages_spec(spec: str) -> str:
     return "all"
 
 
-def _write_preview(df_list: List[pd.DataFrame], limit: int = 3) -> None:
-    """Show a quick preview of the first few tables."""
-    preview_count = min(limit, len(df_list))
-    if preview_count == 0:
-        return
-    st.subheader("Quick preview")
-    for i in range(preview_count):
-        st.caption(f"Table {i+1} — first 10 rows")
-        st.dataframe(df_list[i].head(10), use_container_width=True)
-
-
 def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Light cleaning: drop fully-empty columns/rows, strip whitespace."""
-    # Strip whitespace from string cells
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    # Drop fully empty columns and rows
-    df = df.dropna(axis=1, how='all')
-    df = df.dropna(axis=0, how='all')
-    # Reset index for tidy export
+    df = df.dropna(axis=1, how='all').dropna(axis=0, how='all')
     return df.reset_index(drop=True)
 
 
 def _ensure_tables_exist(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
-    """Ensure we return a list; drop empty frames."""
     cleaned = []
     for t in tables or []:
         if isinstance(t, pd.DataFrame) and not t.empty:
@@ -93,39 +77,50 @@ def _ensure_tables_exist(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
     return cleaned
 
 
+def _set_first_row_as_header(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    header = df.iloc[0].astype(str).tolist()
+    body = df.iloc[1:].copy()
+    # Make headers unique if duplicates
+    seen = {}
+    new_cols = []
+    for col in header:
+        if col in seen:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 0
+            new_cols.append(col)
+    body.columns = new_cols
+    body.reset_index(drop=True, inplace=True)
+    return body
+
+
 # -------------------------------
 # Extraction strategies
 # -------------------------------
 def extract_with_camelot(pdf_path: str, pages: str) -> List[pd.DataFrame]:
-    """
-    Try Camelot with both 'lattice' and 'stream' flavours.
-    Use the flavour that yields more tables (or merge if both yield something).
-    """
     if not _CAMEL0T_AVAILABLE:
         return []
     try:
         tables_all: List[pd.DataFrame] = []
-        # Attempt lattice (works well when there are ruling lines)
         try:
             t_lattice = camelot.read_pdf(pdf_path, pages=pages, flavour="lattice")
             tables_all.extend([t.df for t in t_lattice] if t_lattice else [])
         except Exception:
             pass
-
-        # Attempt stream (works better for whitespace-separated columns)
         try:
             t_stream = camelot.read_pdf(pdf_path, pages=pages, flavour="stream")
             tables_all.extend([t.df for t in t_stream] if t_stream else [])
         except Exception:
             pass
-
         return _ensure_tables_exist(tables_all)
     except Exception:
         return []
 
 
 def extract_with_tabula(pdf_path: str, pages: str) -> List[pd.DataFrame]:
-    """Use tabula to read multiple tables."""
     if not _TABULA_AVAILABLE:
         return []
     try:
@@ -135,24 +130,17 @@ def extract_with_tabula(pdf_path: str, pages: str) -> List[pd.DataFrame]:
         return []
 
 
-def extract_with_pdfplumber(pdf_bytes: bytes, pages: str) -> Tuple[List[pd.DataFrame], List[Tuple[int, str]]]:
-    """
-    pdfplumber heuristic extraction for tables & raw text.
-    Returns (tables, [(page_number, text), ...])
-    """
+def extract_with_pdfplumber(pdf_bytes: bytes, pages: str):
     if not _PDFPLUMBER_AVAILABLE:
         return [], []
-
     table_dfs: List[pd.DataFrame] = []
     text_pages: List[Tuple[int, str]] = []
-
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
             if pages == "all":
                 page_indices = range(total_pages)
             else:
-                # Convert "1,3-5" to 0-based indices
                 idx_set = set()
                 for part in pages.split(","):
                     if "-" in part:
@@ -166,7 +154,6 @@ def extract_with_pdfplumber(pdf_bytes: bytes, pages: str) -> Tuple[List[pd.DataF
 
             for i in page_indices:
                 page = pdf.pages[i]
-                # Try line-based extraction first
                 settings_line = {
                     "vertical_strategy": "lines",
                     "horizontal_strategy": "lines",
@@ -174,8 +161,6 @@ def extract_with_pdfplumber(pdf_bytes: bytes, pages: str) -> Tuple[List[pd.DataF
                     "intersection_x_tolerance": 5,
                 }
                 tab_candidates = page.extract_tables(table_settings=settings_line) or []
-
-                # Fallback to text-based extraction
                 if len(tab_candidates) == 0:
                     settings_text = {
                         "vertical_strategy": "text",
@@ -191,29 +176,19 @@ def extract_with_pdfplumber(pdf_bytes: bytes, pages: str) -> Tuple[List[pd.DataF
                         table_dfs.append(df)
                     except Exception:
                         continue
-
-                # Always capture raw text per page (helpful fallback)
                 try:
                     text_pages.append((i + 1, page.extract_text() or ""))
                 except Exception:
                     text_pages.append((i + 1, ""))
-
     except Exception:
         return [], []
-
     return _ensure_tables_exist(table_dfs), text_pages
 
 
-def extract_tables(pdf_bytes: bytes, pages: str, method: str) -> Tuple[List[pd.DataFrame], List[Tuple[int, str]], str]:
-    """
-    Main dispatcher. Returns (tables, raw_text_by_page, method_used).
-    method ∈ {'auto','camelot','tabula','pdfplumber'}
-    """
-    # Write to temp file for tools that need file paths
+def extract_tables(pdf_bytes: bytes, pages: str, method: str):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
-
     try:
         if method == "camelot":
             tables = extract_with_camelot(tmp_path, pages)
@@ -225,7 +200,6 @@ def extract_tables(pdf_bytes: bytes, pages: str, method: str) -> Tuple[List[pd.D
             tables, text_pages = extract_with_pdfplumber(pdf_bytes, pages)
             return tables, text_pages, "pdfplumber"
         else:
-            # Auto strategy: Camelot → Tabula → pdfplumber
             if _CAMEL0T_AVAILABLE:
                 tables = extract_with_camelot(tmp_path, pages)
                 if len(tables) > 0:
@@ -251,46 +225,55 @@ def build_excel_bytes(
     source_filename: str,
     method_used: str,
     include_text_sheet: bool,
+    combine_tables: bool,
+    first_row_as_header: bool,
+    add_source_table_col: bool,
+    keep_individual_sheets: bool,
 ) -> bytes:
-    """
-    Create an in-memory .xlsx with:
-      - One sheet per table: Table_1, Table_2, ...
-      - Optional 'Raw_Text' sheet
-      - 'Summary' sheet
-    """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Summary
         summary = pd.DataFrame(
             {
-                "Item": ["Source file", "Converted on", "Method used", "Tables found"],
+                "Item": ["Source file", "Converted on", "Method used", "Tables found", "Combined into one sheet"],
                 "Value": [
                     source_filename,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     method_used,
                     len(tables),
+                    "Yes" if combine_tables else "No",
                 ],
             }
         )
         summary.to_excel(writer, index=False, sheet_name=_normalise_sheet_name("Summary"))
 
-        # Tables
-        if len(tables) > 0:
+        # Optionally make a combined sheet
+        if combine_tables and len(tables) > 0:
+            working = []
+            for idx, df in enumerate(tables, start=1):
+                tdf = df.copy()
+                if first_row_as_header:
+                    tdf = _set_first_row_as_header(tdf)
+                if add_source_table_col:
+                    tdf["SourceTable"] = idx
+                working.append(tdf)
+            combined = pd.concat(working, axis=0, ignore_index=True, sort=False)
+            combined.to_excel(writer, index=False, sheet_name=_normalise_sheet_name("All_Data"))
+
+        # Optionally also keep the individual tables
+        if (not combine_tables) or keep_individual_sheets:
             for idx, df in enumerate(tables, start=1):
                 sheet = _normalise_sheet_name(f"Table_{idx}")
-                # Avoid fully empty sheets
-                if df is None or df.empty:
-                    continue
-                df.to_excel(writer, index=False, sheet_name=sheet)
+                to_write = df.copy()
+                if first_row_as_header:
+                    # If combined sheet used headers, keep raw here (or also set headers for consistency)
+                    to_write = _set_first_row_as_header(to_write)
+                to_write.to_excel(writer, index=False, sheet_name=sheet)
 
         # Raw text (optional)
         if include_text_sheet and raw_text_pages:
-            text_rows = []
-            for pnum, text in raw_text_pages:
-                # Keep lines; Excel cell handles long strings
-                text_rows.append({"Page": pnum, "Text": text})
-            text_df = pd.DataFrame(text_rows)
-            text_df.to_excel(writer, index=False, sheet_name=_normalise_sheet_name("Raw_Text"))
+            text_rows = [{"Page": pnum, "Text": text} for pnum, text in raw_text_pages]
+            pd.DataFrame(text_rows).to_excel(writer, index=False, sheet_name=_normalise_sheet_name("Raw_Text"))
 
     output.seek(0)
     return output.getvalue()
@@ -308,8 +291,7 @@ st.set_page_config(
 st.title("📄→📊 PDF to Excel Converter")
 st.write(
     "Upload a PDF and I’ll extract any tables into an Excel workbook. "
-    "Works best with vector PDFs (exported from apps like Word/Excel). "
-    "If no tables are detected, you can include a fallback sheet with the raw text."
+    "If multiple tables are found, you can now **combine them into one sheet**."
 )
 
 with st.sidebar:
@@ -319,44 +301,37 @@ with st.sidebar:
         options=["Auto (recommended)", "Camelot", "Tabula", "pdfplumber"],
         help=(
             "Auto tries Camelot → Tabula → pdfplumber. "
-            "Camelot typically works best when the PDF has visible lines; Tabula requires Java. "
-            "pdfplumber is pure-Python and a safe fallback."
+            "Camelot needs Ghostscript; Tabula needs Java. "
+            "pdfplumber is pure-Python and works on Streamlit Cloud."
         ),
     )
-    pages_spec = st.text_input(
-        "Pages to read",
-        value="all",
-        help="Examples: all, 1, 1-3, 1,3,5-7",
-    )
+    pages_spec = st.text_input("Pages to read", value="all", help="Examples: all, 1, 1-3, 1,3,5-7")
     include_text = st.checkbox("Include raw text as a sheet (fallback)", value=True)
+
+    st.markdown("---")
+    st.subheader("Combine options")
+    combine_tables = st.checkbox("Combine all tables into a single sheet", value=True)
+    first_row_as_header = st.checkbox("First row contains column names", value=True)
+    add_source_table_col = st.checkbox("Add a 'SourceTable' column", value=True)
+    keep_individual_sheets = st.checkbox("Also keep individual Table_1, Table_2... sheets", value=False)
+
     st.caption(
-        "Tip: For scanned/image-only PDFs you may need OCR first (e.g., Adobe, Tesseract) "
-        "before table extraction will work."
+        "Tip: For scanned/image-only PDFs you may need OCR first (e.g., Adobe, Tesseract). "
+        "Combining will align columns automatically; missing fields become blank."
     )
 
 uploaded = st.file_uploader("Upload a PDF file", type=["pdf"])
 
 # Capability hinting
 capabilities = []
-if _CAMEL0T_AVAILABLE:
-    capabilities.append("Camelot ✓")
-else:
-    capabilities.append("Camelot ✗")
-if _TABULA_AVAILABLE:
-    capabilities.append("Tabula ✓")
-else:
-    capabilities.append("Tabula ✗")
-if _PDFPLUMBER_AVAILABLE:
-    capabilities.append("pdfplumber ✓")
-else:
-    capabilities.append("pdfplumber ✗")
+capabilities.append("Camelot ✓" if _CAMEL0T_AVAILABLE else "Camelot ✗")
+capabilities.append("Tabula ✓" if _TABULA_AVAILABLE else "Tabula ✗")
+capabilities.append("pdfplumber ✓" if _PDFPLUMBER_AVAILABLE else "pdfplumber ✗")
 st.caption("Available extractors: " + " • ".join(capabilities))
 
 if uploaded is not None:
     st.success(f"Loaded: **{uploaded.name}** ({uploaded.size/1024:.1f} KB)")
     pdf_bytes = uploaded.read()
-
-    st.session_state.setdefault("cache", {})
 
     chosen_method = {
         "Auto (recommended)": "auto",
@@ -364,16 +339,6 @@ if uploaded is not None:
         "Tabula": "tabula",
         "pdfplumber": "pdfplumber",
     }[method]
-
-    # Normalise pages input
-    def _parse_pages_spec(spec: str) -> str:
-        if not spec or spec.strip().lower() in ("all", "*"):
-            return "all"
-        cleaned = spec.replace(" ", "")
-        import re as _re
-        if _re.fullmatch(r"(\d+(-\d+)?)(,(\d+(-\d+)?))*", cleaned or ""):
-            return cleaned
-        return "all"
 
     normalised_pages = _parse_pages_spec(pages_spec)
 
@@ -391,11 +356,9 @@ if uploaded is not None:
         else:
             if len(tables) > 0:
                 st.success(f"Done. Found **{len(tables)}** table(s) using **{method_used}**.")
-                # Show preview of up to 3 tables
                 st.subheader("Quick preview")
-                for i, df in enumerate(tables[:3], start=1):
-                    st.caption(f"Table {i} — first 10 rows")
-                    st.dataframe(df.head(10), use_container_width=True)
+                preview_df = tables[0].head(10).copy()
+                st.dataframe(preview_df, use_container_width=True)
             else:
                 st.info(
                     "No tables found. I’ve produced an Excel with a Summary sheet "
@@ -408,6 +371,10 @@ if uploaded is not None:
                 source_filename=uploaded.name,
                 method_used=method_used,
                 include_text_sheet=include_text,
+                combine_tables=combine_tables,
+                first_row_as_header=first_row_as_header,
+                add_source_table_col=add_source_table_col,
+                keep_individual_sheets=keep_individual_sheets,
             )
 
             download_name = re.sub(r"\.pdf$", "", uploaded.name, flags=re.IGNORECASE) or "converted"
@@ -420,14 +387,3 @@ if uploaded is not None:
             )
 else:
     st.info("Choose a PDF to get started.")
-
-
-# Footer note
-st.markdown(
-    "<hr/>"
-    "<small>"
-    "Notes: Camelot and Tabula work best on digitally-generated PDFs. Scanned PDFs typically need OCR first. "
-    "Camelot requires Ghostscript; Tabula needs Java. If you’re unsure, use ‘Auto’ and include raw text."
-    "</small>",
-    unsafe_allow_html=True,
-)
